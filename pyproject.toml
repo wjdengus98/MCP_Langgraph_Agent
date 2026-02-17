@@ -1,0 +1,23 @@
+[project]
+name = "mcp-agent-project"
+version = "0.1.0"
+description = "MCP + LangGraph Agent System"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "fastapi>=0.129.0",
+    "feedparser>=6.0.12",
+    "geopy>=2.4.1",
+    "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "langchain>=1.2.10",
+    "langchain-mcp-adapters>=0.2.1",
+    "langchain-openai>=1.1.9",
+    "langgraph>=1.0.8",
+    "mcp>=1.26.0",
+    "python-dotenv>=1.2.1",
+    "python-multipart>=0.0.22",
+    "tenacity>=9.1.4",
+    "uvicorn>=0.40.0",
+]
