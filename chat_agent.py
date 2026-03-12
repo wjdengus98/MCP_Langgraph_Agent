@@ -13,8 +13,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-#from langchain.agents import create_agent
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
+#from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -23,7 +23,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 import uvicorn
-import os
 from dotenv import load_dotenv
 
 # 환경 변수 로드
@@ -68,12 +67,18 @@ def create_prompt_template() -> ChatPromptTemplate:
         ]
     )
 
-def create_agent(tools):
+def create_agent_executor(tools):
     """주어진 도구를 사용하여 에이전트를 생성"""
     memory = InMemorySaver()
-    prompt = create_prompt_template()
+    prompt_template = create_prompt_template()
     llm = ChatOpenAI(model="gpt-4o-mini")
-    return create_react_agent(llm,tools, checkpointer=memory, prompt = prompt)
+    system_prompt = prompt_template.messages[0].prompt.template
+    return create_agent(
+        model=llm,
+        tools=tools,
+        checkpointer=memory,
+        system_prompt= system_prompt
+    )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -93,7 +98,7 @@ async def lifespan(app: FastAPI):
                 print(f" - {tool.name}")
                 
             # 로드한 도구들로 에이전트 생성
-            app.state.agent_executor = create_agent(tools)
+            app.state.agent_executor = create_agent_executor(tools)
             print("에이전트 설정 완료. 애플리케이션이 준비되었습니다.")
             yield
             
@@ -119,15 +124,82 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "I'm ready!"}
+    """서버 상태 확인"""
+    return {"status": "ok", "message": "Chat Agent is ready!"}
+
 
 @app.get("/health")
 async def health_check():
-    agent_ready = hasattr(app.state, 'agent_executor')
-    #             app.state 확인만
+    """에이전트 준비 상태 확인"""
+    agent_ready = hasattr(app.state, 'agent_executor') and app.state.agent_executor is not None
+    return {
+        "status": "healthy" if agent_ready else "initializing",
+        "agent_ready": agent_ready
+    }
     
-    return {"status": "healthy", "agent_ready": agent_ready}
-       
+async def stream_agent_response(agent_executor, message: str, session_id: str):
+    """에이전트의 응답을 스트리밍으로 전송"""
+    if agent_executor is None:
+        yield "에이전트가 준비되지 않았습니다.\n\n"
+        return
+
+    try:
+        config = {"configurable" : {"thread_id" : session_id}}
+        input_message = HumanMessage(content=message)
+        
+        async for event in agent_executor.astream_events(
+            {"messages" : [input_message]},
+            config=config,
+            version = "v2",
+        ):
+            
+            kind = event["event"]
+            
+            if kind == "on_chat_model_stream":
+                content = event["data"]["chunk"].content
+                
+                if content:
+                    yield f"data: {content}\n\n"
+            
+            elif kind == "on_tool_start":
+                # 사용자에게 ..와 같은 상태 표시
+                tool_name = event["name"]
+                yield f"data: {tool_name} 도구 사용 중입니다...."
+            
+            elif kind == "on_tool_end":
+                #도구 실행 완료 표시
+                yield f"data: 도구 실행 완료"
+    
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        
+@app.post("/chat")
+async def chat(request: Request,
+    message: str = Form(...),
+    session_id: str = Form(...)):
+    """
+    1. 사용자 메시지 받기
+    2. 에이전트에게 전달
+    3. 에이전트 응답을 실시간으로 스트리밍
+    """
+    
+    print(f"메시지 수신 (세션 : {session_id}): {message[:50]}....)")
+    
+    # 에이전트 불러옴
+    agent_executor = request.app.state.agent_executor
+    
+    if agent_executor is None:
+         return {"error": "에이전트가 준비되지 않았습니다."}
+     
+    return StreamingResponse(
+        stream_agent_response(agent_executor, message, session_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+    
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
