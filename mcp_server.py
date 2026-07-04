@@ -5,17 +5,19 @@ MCP Server - AI Agent를 위한 도구 모음
 1. scrape_page_text: 웹페이지 텍스트 스크래핑
 2. get_weather: 도시별 날씨 조회
 3. get_news_headlines: 구글 RSS 뉴스 헤드라인
-4. get_kbo_rank: KBO 프로야구 순위
+4. get_kbo_rank: KBO 프로야구 순위 (KBO 공식 사이트, 시즌 자동 반영)
 5. today_schedule: 오늘의 일정 (Mock 데이터) -> 노션, 구글 스케줄러 연동
 6. daily_quote: 영감을 주는 명언 생성
-7. brief_today: 종합 브리핑 오케스트레이터
+7. web_search_tavily: langchain-tavily(TavilySearch) 기반 실시간 웹 검색
+8. brife_today: 종합 브리핑 오케스트레이터
 """
 
 import json
 import logging
-from typing import Optional
+from typing import Optional, Literal
 import feedparser
 import httpx
+import pandas as pd
 from bs4 import BeautifulSoup
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -23,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from tenacity import retry, stop_after_attempt, wait_exponential
+from langchain_tavily import TavilySearch
 from dotenv import load_dotenv
 import os
 
@@ -39,6 +42,18 @@ logger = logging.getLogger(__name__)
 # 서버 인스턴스 생성
 mcp = FastMCP("MCP-Agent-Server")
 
+# Tavily 검색 도구 (langchain-tavily)
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+tavily_search_tool = (
+    TavilySearch(
+        max_results=10,
+        include_answer=True,
+        search_depth="advanced",
+        exclude_domains=["youtube.com", "youtu.be"],
+    )
+    if TAVILY_API_KEY
+    else None
+)
 # 웹페이지 스크래핑 도구
 @mcp.tool()
 def scrape_page_text(url:str) -> str:
@@ -177,47 +192,49 @@ def get_news_headlines(max_items: int = 10) -> str:
         logger.error(error_msg)
         return error_msg
 
-#4. KBO 프로야구 순위 가져오기
+#4. KBO 프로야구 순위 가져오기 (KBO 고ㅓㅇ식 사이트 - 시즌 자동 반영, 하드코딩 불필요)
 @mcp.tool()
 def get_kbo_rank() -> str:
     """
-    한국 프로야구(KBO) 구단의 현재 순위를 가져옵니다.
+   한국 프로야구(KBO) 구단의 현재 시즌 순위를 KBO 공식 홈페이지에서 가져옵니다.
     
     Returns:
-        KBO 순위 정보 JSON 문자열
+        KBO 순위 정보 문자열
     """
     try:
-        logger.info("KBO 순위 조회 시작")
+        logger.info("KBO 순위 조회 시작 (KBO 공식 사이트)")
         
-        # 2025 시즌 -> 2026 시즌 업데이트 안됨.
-        url = "https://sports.daum.net/prx/hermes/api/team/rank.json?leagueCode=kbo&seasonKey=2025"
+        url = "https://www.koreabaseball.com/Record/TeamRank/TeamRankDaily.aspx"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
         
-        response = httpx.get(url, timeout=10.0)
-        response.raise_for_status()
+        resp = httpx.get(url, headers=headers, timeout=10.0)
+        resp.raise_for_status()
         
-        # Json 파싱
-        data = response.json()
-        teams = data.get('list', [])
-        
-        if not teams:
+        # 페이지 내 <table> 을 DataFrame 으로 파싱 (순위표가 첫 번째 테이블)
+        tables = pd.read_html(resp.text)
+        if not tables:
             return "KBO 순위 데이터를 가져올 수 없습니다."
         
-        # 순위표 생성
-        result = []
-        result.append("## 📊 2025 KBO 리그 순위\n")
+        rank_df = tables[0]
         
-        for team in teams:
-            rank_info = team.get("rank", {})
-            name = team.get("shortName", "팀명 없음")
-            
-            # 각 팀 정보 포맷팅
-            rank_line = (
-                f"{rank_info.get('rank')}위: {name} - "
-                f"{rank_info.get('win')}승 {rank_info.get('loss')}패 "
-                f"(승률 {rank_info.get('wpct'):.3f}, {rank_info.get('streak')})"
-            )
-            result.append(rank_line)      
-            
+        result = []
+        result.append("## 📊 KBO 리그 순위 (실시간, KBO 공식 사이트 기준)\n")
+        
+        for _, row in rank_df.iterrows():
+            try:
+                rank_line = (
+                    f"{row['순위']}위: {row['팀명']} - "
+                    f"{row['승']}승 {row['패']}패 {row['무']}무 "
+                    f"(승률 {row['승률']}, 게임차 {row['게임차']}, "
+                    f"최근10경기 {row['최근10경기']}, 연속 {row['연속']})"
+                )
+                result.append(rank_line)
+            except KeyError:
+                # 사이트 테이블 컬럼명이 바뀐 경우를 대비한 폴백
+                result.append(" | ".join(str(v) for v in row.values))
+        
         logger.info("KBO 순위 조회 완료")
         return "\n".join(result)
         
@@ -227,21 +244,88 @@ def get_kbo_rank() -> str:
         return error_msg
 
 #5. 일정 가져오기(Mock data -> 노션,구글 스케줄 연동(update 예정))
+# @mcp.tool()
+# def today_schedule() -> str:
+#     """일정을 가져옵니다."""
+#     events = [
+#             "09:00 - 데일리 스탠드업 미팅",
+#             "10:30 - LangGraph 학습 시간",
+#             "13:00 - 점심 약속 (강남역)",
+#             "15:00 - MCP 프로젝트 개발",
+#             "18:00 - 운동 (헬스장)",
+#             "20:00 - 저녁 식사"
+#         ]
+#     result = "\n".join([f"{event}" for event in events])
+#     logger.info(f"일정 조회 완료: {len(events)}개 항목")
+    
+#     return result
+
+from googleapiclient.discovery import build
+from datetime import datetime
+import pytz
+
+# Google calender Test
 @mcp.tool()
 def today_schedule() -> str:
-    """일정을 가져옵니다."""
-    events = [
-            "09:00 - 데일리 스탠드업 미팅",
-            "10:30 - LangGraph 학습 시간",
-            "13:00 - 점심 약속 (강남역)",
-            "15:00 - MCP 프로젝트 개발",
-            "18:00 - 운동 (헬스장)",
-            "20:00 - 저녁 식사"
-        ]
-    result = "\n".join([f"{event}" for event in events])
+    """Google Calendar에서 오늘의 일정을 가져옵니다."""
+    
+    logger.info("Google Calendar 일정 조회 시작")
+    
+    # 인증
+    from google_auth import get_credentials
+    creds = get_credentials()
+    
+    # Calendar API 서비스
+    service = build('calendar', 'v3', credentials=creds)
+    
+    # 한국 시간대
+    kst = pytz.timezone('Asia/Seoul')
+    now = datetime.now(kst)
+    
+    # 오늘 00:00 ~ 23:59
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    
+    # 일정 가져오기
+    events_result = service.events().list(
+        calendarId='primary',
+        timeMin=today_start.isoformat(),
+        timeMax=today_end.isoformat(),
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute()
+    
+    events = events_result.get('items', [])
+    
+    if not events:
+        logger.info("오늘 일정 없음")
+        return "📅 오늘은 예정된 일정이 없습니다."
+    
+    # 일정 포맷팅
+    schedule_list = []
+    for event in events:
+        start = event['start'].get('dateTime', event['start'].get('date'))
+        summary = event.get('summary', '제목 없음')
+        location = event.get('location', '')
+        
+        # 시간 포맷
+        if 'T' in start:  # dateTime 형식
+            time_str = datetime.fromisoformat(start).strftime('%H:%M')
+            if location:
+                schedule_list.append(f"{time_str} - {summary} ({location})")
+            else:
+                schedule_list.append(f"{time_str} - {summary}")
+        else:  # 종일 일정
+            if location:
+                schedule_list.append(f"종일 - {summary} ({location})")
+            else:
+                schedule_list.append(f"종일 - {summary}")
+    
+    result = "\n".join(schedule_list)
     logger.info(f"일정 조회 완료: {len(events)}개 항목")
     
     return result
+
 
 #6. 영감을 주는 명언
 @mcp.tool()
@@ -273,7 +357,130 @@ def daily_quote() -> str:
     logger.info("명언 생성 완료")
     return response.content
 
-# 7. 종합 브리핑
+_search_cleanup_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "당신은 웹 검색 결과에서 광고, 구독 안내, 조회수, 채널 정보 같은 "
+            "본문과 무관한 부가 텍스트를 제거하고 핵심 사실만 간결하게 재정리하는 "
+            "편집자입니다. 각 검색 결과의 'content'를 읽고, 검색 질의와 관련된 "
+            "핵심 내용만 2~3문장으로 요약하세요. 원문에 없는 내용을 추가하거나 "
+            "추측하지 마세요. 관련 내용이 전혀 없는 결과는 content를 빈 문자열로 "
+            "두세요.\n\n"
+            "다음 JSON 형식으로만 응답하세요 (마크다운 코드블록이나 다른 텍스트 없이):\n"
+            '{{"cleaned": [{{"index": 1, "content": "정리된 내용"}}, ...]}}',
+        ),
+        (
+            "human",
+            "검색 질의: {query}\n\n검색 결과:\n{raw_results}",
+        ),
+    ]
+)
+
+def _clean_search_results(query: str, results: list) -> list:
+    """
+    Tavily 검색 결과의 content를 LLM으로 한 번 더 정제한다.
+    광고/구독 안내/조회수 등 부가 텍스트를 제거하고 질의와 관련된 핵심만 남긴다.
+    정제 과정에서 오류가 나면, 원본 content를 그대로 사용하는 쪽으로 안전하게 폴백한다.
+    """
+    if not results:
+        return results
+ 
+    raw_results_text = "\n".join(
+        f"{i}. {item.get('content', '')}" for i, item in enumerate(results, 1)
+    )
+ 
+    try:
+        model_name = os.getenv("LLM_MODEL", "gpt-5-mini")
+        cleanup_model = ChatOpenAI(model=model_name, temperature=0)
+ 
+        chain = _search_cleanup_prompt | cleanup_model
+        response = chain.invoke({"query": query, "raw_results": raw_results_text})
+ 
+        parsed = json.loads(response.content)
+        cleaned_by_index = {
+            item["index"]: item["content"] for item in parsed.get("cleaned", [])
+        }
+ 
+        for i, item in enumerate(results, 1):
+            if i in cleaned_by_index:
+                # LLM이 빈 문자열을 줬다면 "관련 없음" 판단이므로 제외 대상으로 표시.
+                # 정제 결과가 있으면 그걸로 교체.
+                item["content"] = cleaned_by_index[i].strip()
+            # cleaned_by_index 에 아예 없는 인덱스(파싱 누락 등)는 원본 유지
+ 
+        return results
+ 
+    except Exception as e:
+        # 정제 실패 시 원본 결과를 그대로 반환 (검색 자체는 실패시키지 않음)
+        logger.warning(f"검색 결과 정제 실패, 원본 사용: {str(e)}")
+        return results
+
+#7. Tavily 기반 실시간 웹 검색 (langchain-tavily)
+@mcp.tool()
+def web_search_tavily(
+    query: str,
+    max_results: int = 5,
+    topic: Literal["general", "news", "finance"] = "general",
+) -> str:
+    """
+    langchain-tavily 의 TavilySearch 도구를 사용하여 실시간 웹 검색을 수행합니다.
+    Tavily 원본 결과를 LLM으로 한 번 더 정제하여, 광고/구독 안내/조회수 같은
+    부가 텍스트를 제거하고 질의와 관련된 핵심 내용만 남긴 뒤 반환합니다.
+ 
+    Args:
+        query: 검색할 질의문
+        max_results: 반환할 최대 검색 결과 수 (기본값 5, 최대 10)
+        topic: 검색 주제. 반드시 'general', 'news', 'finance' 중 하나만 사용.
+            - 기술/AI/프로그래밍 등 일반적인 질문 -> 'general'
+            - 최신 뉴스/시사 검색 -> 'news'
+            - 금융/주식/시장 관련 검색 -> 'finance'
+    Returns:
+        검색 결과를 정리한 문자열 or 에러 메시지
+    """
+    if tavily_search_tool is None:
+        return (
+            "TAVILY_API_KEY 가 설정되어 있지 않습니다. "
+            ".env 파일에 TAVILY_API_KEY=tvly-... 형태로 추가해주세요."
+        )
+ 
+    try:
+        logger.info(f"Tavily 웹 검색 시작: {query} (topic={topic})")
+ 
+        # langchain-tavily 의 TavilySearch 는 max_results를 invoke 시점에
+        # 바꿀 수 없으므로(인스턴스 생성 시 고정), 받아온 결과를 잘라서 사용.
+        # topic 은 invoke 시점에 지정 가능한 파라미터라 그대로 전달.
+        response = tavily_search_tool.invoke({"query": query, "topic": topic})
+        results = response.get("results", [])[: max(1, min(max_results, 10))]
+ 
+        # LLM으로 한 번 더 정제 (광고/구독 안내/조회수 등 제거, 핵심만 재요약)
+        results = _clean_search_results(query, results)
+ 
+        result_lines = []
+ 
+        # Tavily 가 생성한 요약 답변이 있으면 먼저 표시
+        answer = response.get("answer")
+        if answer:
+            result_lines.append(f"## 📝 요약 답변\n{answer}\n")
+ 
+        result_lines.append("## 🔎 검색 결과")
+        for i, item in enumerate(results, 1):
+            title = item.get("title", "제목 없음")
+            url = item.get("url", "#")
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            result_lines.append(f"{i}. [{title}]({url})\n   {content}")
+ 
+        logger.info(f"Tavily 웹 검색 완료: {len(results)}개 결과")
+        return "\n".join(result_lines)
+ 
+    except Exception as e:
+        error_msg = f"Tavily 웹 검색 실패: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+# 8. 종합 브리핑
 @mcp.tool()
 def brief_today() -> str:
     """
@@ -368,6 +575,13 @@ if __name__ == "__main__":
     # result = daily_quote()
     # print(f"모델의 응답: {result}")
     
+    # =========Google Calendar 테스트===============
+    # result = today_schedule()
+    # print(result)
+    
+    # ======== Tavily 검색 테스트 =========
+    result = web_search_tavily("2022년 카타르 월드컵 순위")
+    print(result)    
     #=========== MCP 서버 테스트 =============
-    mcp.run(transport="streamable-http")
+    # mcp.run(transport="streamable-http")
 
