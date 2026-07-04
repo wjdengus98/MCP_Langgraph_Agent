@@ -138,9 +138,20 @@ async def health_check():
     }
     
 async def stream_agent_response(agent_executor, message: str, session_id: str):
-    """에이전트의 응답을 스트리밍으로 전송"""
+    """
+    에이전트의 응답을 스트리밍으로 전송.
+
+    SSE 이벤트에 event 필드를 붙여서 프론트엔드가 타입별로 명확히 구분할 수 있게 한다.
+    - event: text       -> 답변 텍스트 청크 (data에 텍스트 그대로)
+    - event: tool_start -> 도구 사용 시작 (data에 도구명)
+    - event: tool_end   -> 도구 사용 종료 (data는 고정 문자열)
+    - event: error      -> 에러 발생 (data에 에러 메시지)
+
+    SSE 스펙상 각 이벤트는 빈 줄(\n\n)로 끝나야 클라이언트가 이벤트 경계를
+    올바르게 인식하므로, 모든 분기에서 빠짐없이 \n\n 로 끝낸다.
+    """
     if agent_executor is None:
-        yield "에이전트가 준비되지 않았습니다.\n\n"
+        yield "event: error\ndata: 에이전트가 준비되지 않았습니다.\n\n"
         return
 
     try:
@@ -159,19 +170,24 @@ async def stream_agent_response(agent_executor, message: str, session_id: str):
                 content = event["data"]["chunk"].content
                 
                 if content:
-                    yield f"data: {content}\n\n"
+                    # SSE 스펙상 event: 필드가 data: 보다 먼저 와야 클라이언트가
+                    # 이벤트 타입을 올바르게 인식한다. data 필드는 줄바꿈을 포함할
+                    # 수 없으므로, 텍스트 안에 개행이 있으면 "data: " 를 줄마다 반복한다.
+                    lines = "\n".join(f"data: {line}" for line in content.split("\n"))
+                    yield f"event: text\n{lines}\n\n"
             
             elif kind == "on_tool_start":
-                # 사용자에게 ..와 같은 상태 표시
+                # 사용자에게 도구 사용 중임을 알리는 상태 표시
                 tool_name = event["name"]
-                yield f"data: {tool_name} 도구 사용 중입니다...."
+                yield f"event: tool_start\ndata: {tool_name}\n\n"
             
             elif kind == "on_tool_end":
-                #도구 실행 완료 표시
-                yield f"data: 도구 실행 완료"
+                # 도구 실행 완료 표시
+                yield "event: tool_end\ndata: done\n\n"
     
     except Exception as e:
         print(f"오류 발생: {e}")
+        yield f"event: error\ndata: {str(e)}\n\n"
         
 @app.post("/chat")
 async def chat(request: Request,
