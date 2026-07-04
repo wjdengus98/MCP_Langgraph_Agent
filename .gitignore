@@ -35,3 +35,7 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Google calender
+credentials.json
+token.json
