@@ -249,12 +249,16 @@ def get_kbo_rank() -> str:
 @mcp.tool()
 def today_schedule() -> str:
     """Google Calendar에서 오늘의 일정을 가져옵니다."""
-    
+
     logger.info("Google Calendar 일정 조회 시작")
-    
-    # 인증
+
+    # 인증 (배포 환경에서 인증 정보가 없으면 도구가 죽지 않고 안내 메시지를 반환)
     from google_auth import get_credentials
-    creds = get_credentials()
+    try:
+        creds = get_credentials()
+    except Exception as e:
+        logger.warning(f"Google Calendar 인증 실패: {e}")
+        return f"📅 Google Calendar 연동이 설정되지 않아 일정을 가져올 수 없습니다. ({e})"
     
     # Calendar API 서비스
     service = build('calendar', 'v3', credentials=creds)

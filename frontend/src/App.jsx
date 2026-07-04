@@ -5,7 +5,9 @@ import Welcome from './components/Welcome.jsx'
 import { SparkIcon } from './components/Icons.jsx'
 import { parseSSEStream } from './lib/sse.js'
 
-const API_URL = 'http://localhost:8001/chat'
+// 배포 시에는 백엔드(chat_agent.py)가 프론트엔드를 같은 도메인에서 서빙하므로
+// 상대 경로를 쓰고, 로컬 개발 시에는 vite.config.js의 프록시가 8001로 전달한다.
+const API_URL = import.meta.env.VITE_API_URL || '/chat'
 
 const genSessionId = () =>
   typeof crypto !== 'undefined' && crypto.randomUUID
@@ -118,7 +120,7 @@ export default function App() {
       } else {
         const message =
           err instanceof TypeError
-            ? '서버에 연결할 수 없습니다. 백엔드 서버(localhost:8001)가 실행 중인지 확인해주세요.'
+            ? '서버에 연결할 수 없습니다. 백엔드 서버가 실행 중인지 확인해주세요.'
             : err.message
         updateLast((m) => ({ ...m, error: message }))
       }

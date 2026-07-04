@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.local
+credentials.json
+token.json
+frontend/node_modules
+frontend/dist
+.vscode
+.idea
+README.md

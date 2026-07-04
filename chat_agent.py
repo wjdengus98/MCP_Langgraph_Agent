@@ -9,10 +9,13 @@ Chat Agent Server - MCP 도구를 사용하는 LangGraph 에이전트 서버
 5. 결과를 SSE(Server-Sent Events)로 스트리밍 응답
 """
 
+import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from langchain.agents import create_agent
 #from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
@@ -27,6 +30,13 @@ from dotenv import load_dotenv
 
 # 환경 변수 로드
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 배포 환경에서 바꿀 수 있도록 환경 변수로 분리 (기본값은 로컬 개발 기준)
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000/mcp")
+PORT = int(os.getenv("PORT", "8001"))
 
 def create_prompt_template() -> ChatPromptTemplate:
     """
@@ -71,7 +81,7 @@ def create_agent_executor(tools):
     """주어진 도구를 사용하여 에이전트를 생성"""
     memory = InMemorySaver()
     prompt_template = create_prompt_template()
-    llm = ChatOpenAI(model="gpt-4o-mini")
+    llm = ChatOpenAI(model="gpt-4.1-mini")
     system_prompt = prompt_template.messages[0].prompt.template
     return create_agent(
         model=llm,
@@ -85,7 +95,7 @@ async def lifespan(app: FastAPI):
     """Fast API 애플리케이션의 생명주기 동안 MCP 연결 및 에이전트 설정 관리"""
     print("애플리케이션 시작: MCP 서버에 연결하고 에이전트를 설정합니다.")
     
-    async with streamable_http_client("http://localhost:8000/mcp") as (read, write, _):
+    async with streamable_http_client(MCP_SERVER_URL) as (read, write, _):
         async with ClientSession(read, write) as session:
             # 세션 초기화
             await session.initialize()
@@ -121,12 +131,6 @@ app.add_middleware(
 #==================================
 # API 엔드포인트
 #==================================
-
-@app.get("/")
-async def root():
-    """서버 상태 확인"""
-    return {"status": "ok", "message": "Chat Agent is ready!"}
-
 
 @app.get("/health")
 async def health_check():
@@ -199,7 +203,8 @@ async def chat(request: Request,
     3. 에이전트 응답을 실시간으로 스트리밍
     """
     
-    print(f"메시지 수신 (세션 : {session_id}): {message[:50]}....)")
+    # print()는 Windows 콘솔(cp949 등)에서 인코딩 에러로 요청을 죽일 수 있어 logging 사용
+    logger.info(f"메시지 수신 (세션 : {session_id}): {message[:50]}....")
     
     # 에이전트 불러옴
     agent_executor = request.app.state.agent_executor
@@ -217,5 +222,13 @@ async def chat(request: Request,
     )
     
 
+# 빌드된 프론트엔드(frontend/dist)가 있으면 같은 서버에서 정적 파일로 서빙.
+# API 라우트(/chat, /health)가 먼저 매칭되고, 나머지 경로가 프론트엔드로 간다.
+# 로컬 개발(Vite dev 서버 사용) 시에는 dist가 없어도 API만으로 정상 동작한다.
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
