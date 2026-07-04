@@ -14,7 +14,6 @@ MCP Server - AI Agent를 위한 도구 모음
 
 import json
 import logging
-from typing import Optional, Literal
 import feedparser
 import httpx
 import pandas as pd
@@ -25,9 +24,13 @@ from mcp.server.fastmcp import FastMCP
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from tenacity import retry, stop_after_attempt, wait_exponential
-from langchain_tavily import TavilySearch
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.agents import create_agent
 from dotenv import load_dotenv
 import os
+from googleapiclient.discovery import build
+from datetime import datetime
+import pytz
 
 # 환경 설정
 load_dotenv()
@@ -42,18 +45,10 @@ logger = logging.getLogger(__name__)
 # 서버 인스턴스 생성
 mcp = FastMCP("MCP-Agent-Server")
 
-# Tavily 검색 도구 (langchain-tavily)
+# Tavily 웹 검색 (WebResearchAgent 가 Tavily 원격 MCP 서버에 접속해서 사용)
+# TAVILY_API_KEY 가 .env 에 없으면 도구 호출 시점에 안내 메시지 반환
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-tavily_search_tool = (
-    TavilySearch(
-        max_results=10,
-        include_answer=True,
-        search_depth="advanced",
-        exclude_domains=["youtube.com", "youtu.be"],
-    )
-    if TAVILY_API_KEY
-    else None
-)
+
 # 웹페이지 스크래핑 도구
 @mcp.tool()
 def scrape_page_text(url:str) -> str:
@@ -196,8 +191,14 @@ def get_news_headlines(max_items: int = 10) -> str:
 @mcp.tool()
 def get_kbo_rank() -> str:
     """
-   한국 프로야구(KBO) 구단의 현재 시즌 순위를 KBO 공식 홈페이지에서 가져옵니다.
-    
+    한국 프로야구(KBO) 구단의 현재 시즌 순위를 KBO 공식 홈페이지에서 가져옵니다.
+    이 페이지는 시즌을 별도로 지정하지 않아도 항상 '현재 진행 중인 시즌'의
+    최신 순위를 보여주므로, 매 시즌 코드를 갱신할 필요가 없습니다.
+ 
+    주의: 이 도구는 오늘 기준 '현재 진행 중인 시즌'의 순위만 제공합니다.
+    2025년 등 이미 종료된 과거 시즌의 순위를 물어보는 경우에는 이 도구 대신
+    web_search_tavily(query="2025 KBO 순위") 처럼 웹 검색 도구를 사용하세요.
+ 
     Returns:
         KBO 순위 정보 문자열
     """
@@ -243,28 +244,8 @@ def get_kbo_rank() -> str:
         logger.error(error_msg)
         return error_msg
 
-#5. 일정 가져오기(Mock data -> 노션,구글 스케줄 연동(update 예정))
-# @mcp.tool()
-# def today_schedule() -> str:
-#     """일정을 가져옵니다."""
-#     events = [
-#             "09:00 - 데일리 스탠드업 미팅",
-#             "10:30 - LangGraph 학습 시간",
-#             "13:00 - 점심 약속 (강남역)",
-#             "15:00 - MCP 프로젝트 개발",
-#             "18:00 - 운동 (헬스장)",
-#             "20:00 - 저녁 식사"
-#         ]
-#     result = "\n".join([f"{event}" for event in events])
-#     logger.info(f"일정 조회 완료: {len(events)}개 항목")
-    
-#     return result
 
-from googleapiclient.discovery import build
-from datetime import datetime
-import pytz
-
-# Google calender Test
+# Google calender
 @mcp.tool()
 def today_schedule() -> str:
     """Google Calendar에서 오늘의 일정을 가져옵니다."""
@@ -357,128 +338,113 @@ def daily_quote() -> str:
     logger.info("명언 생성 완료")
     return response.content
 
-_search_cleanup_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "당신은 웹 검색 결과에서 광고, 구독 안내, 조회수, 채널 정보 같은 "
-            "본문과 무관한 부가 텍스트를 제거하고 핵심 사실만 간결하게 재정리하는 "
-            "편집자입니다. 각 검색 결과의 'content'를 읽고, 검색 질의와 관련된 "
-            "핵심 내용만 2~3문장으로 요약하세요. 원문에 없는 내용을 추가하거나 "
-            "추측하지 마세요. 관련 내용이 전혀 없는 결과는 content를 빈 문자열로 "
-            "두세요.\n\n"
-            "다음 JSON 형식으로만 응답하세요 (마크다운 코드블록이나 다른 텍스트 없이):\n"
-            '{{"cleaned": [{{"index": 1, "content": "정리된 내용"}}, ...]}}',
-        ),
-        (
-            "human",
-            "검색 질의: {query}\n\n검색 결과:\n{raw_results}",
-        ),
-    ]
-)
-
-def _clean_search_results(query: str, results: list) -> list:
+#7. Tavily 원격 MCP 서버 기반 웹 검색 (WebResearchAgent)
+_WEB_SEARCH_SYSTEM_PROMPT = """당신은 웹 검색 전문가입니다.
+ 
+tavily_search 도구 사용 시 주의사항:
+- topic 파라미터는 반드시 'general', 'news', 'finance' 중 하나만 사용하세요.
+- 기술, AI, 프로그래밍 관련 질문도 topic='general'을 사용하세요.
+- 최신 뉴스 검색 시에만 topic='news'를 사용하세요.
+- 금융/주식 관련 검색 시에만 topic='finance'를 사용하세요.
+ 
+[최종 출력: 사실과 의견을 분리하세요.]
+'Fact:' 같은 표시 없이, 사실 정보만 보여주세요.
+출처(Citation)를 함께 표시하세요.
+"""
+ 
+ 
+class WebResearchAgent:
     """
-    Tavily 검색 결과의 content를 LLM으로 한 번 더 정제한다.
-    광고/구독 안내/조회수 등 부가 텍스트를 제거하고 질의와 관련된 핵심만 남긴다.
-    정제 과정에서 오류가 나면, 원본 content를 그대로 사용하는 쪽으로 안전하게 폴백한다.
+    MCP 기반 웹 검색 에이전트
+ 
+    우리 mcp_server.py 가 로컬에서 검색 로직을 구현하는 대신, Tavily가 직접
+    운영하는 원격 MCP 서버(mcp.tavily.com)에 '클라이언트'로 접속해서 그 서버의
+    tavily_search 도구를 그대로 가져다 쓰는 방식.
     """
-    if not results:
-        return results
  
-    raw_results_text = "\n".join(
-        f"{i}. {item.get('content', '')}" for i, item in enumerate(results, 1)
-    )
+    def __init__(self):
+        self.model = ChatOpenAI(model="gpt-4o")
+        self.mcp_client = None
+        self.agent = None
+        self.initialized = False
  
-    try:
-        model_name = os.getenv("LLM_MODEL", "gpt-5-mini")
-        cleanup_model = ChatOpenAI(model=model_name, temperature=0)
+    async def initialize(self) -> None:
+        """MCP 클라이언트 및 에이전트 초기화 (최초 호출 시 한 번만 수행)"""
+        if self.initialized:
+            return
  
-        chain = _search_cleanup_prompt | cleanup_model
-        response = chain.invoke({"query": query, "raw_results": raw_results_text})
+        if not TAVILY_API_KEY:
+            raise ValueError("TAVILY_API_KEY 환경 변수가 필요합니다")
  
-        parsed = json.loads(response.content)
-        cleaned_by_index = {
-            item["index"]: item["content"] for item in parsed.get("cleaned", [])
-        }
+        self.mcp_client = MultiServerMCPClient(
+            {
+                "tavily": {
+                    "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}",
+                    "transport": "streamable_http",
+                }
+            }
+        )
  
-        for i, item in enumerate(results, 1):
-            if i in cleaned_by_index:
-                # LLM이 빈 문자열을 줬다면 "관련 없음" 판단이므로 제외 대상으로 표시.
-                # 정제 결과가 있으면 그걸로 교체.
-                item["content"] = cleaned_by_index[i].strip()
-            # cleaned_by_index 에 아예 없는 인덱스(파싱 누락 등)는 원본 유지
+        tools = await self.mcp_client.get_tools(server_name="tavily")
+        logger.info(f"[WEB AGENT] [INIT] Tavily 도구 로드: {[t.name for t in tools]}")
  
-        return results
+        self.agent = create_agent(self.model, tools)
+        self.initialized = True
+        logger.info("[WEB AGENT] [INIT] 초기화 완료")
  
-    except Exception as e:
-        # 정제 실패 시 원본 결과를 그대로 반환 (검색 자체는 실패시키지 않음)
-        logger.warning(f"검색 결과 정제 실패, 원본 사용: {str(e)}")
-        return results
-
-#7. Tavily 기반 실시간 웹 검색 (langchain-tavily)
+    async def answer(self, query: str) -> str:
+        """
+        질의를 받아 에이전트를 실행하고, 도구 호출 없이 최종 답변 텍스트만 반환한다.
+        (mcp_server.py 의 web_search_tavily 도구가 이 메서드를 그대로 감싸서 사용)
+        """
+        if not self.initialized:
+            await self.initialize()
+ 
+        response = await self.agent.ainvoke(
+            {
+                "messages": [
+                    {"role": "system", "content": _WEB_SEARCH_SYSTEM_PROMPT},
+                    {"role": "user", "content": query},
+                ]
+            }
+        )
+        final_message = response["messages"][-1]
+        return final_message.content or "응답을 생성하지 못했습니다."
+ 
+ 
+# 모듈 전역에서 한 번만 생성 -> 매 호출마다 MCP 세션을 새로 맺지 않고 재사용
+_web_research_agent = WebResearchAgent()
+ 
+ 
 @mcp.tool()
-def web_search_tavily(
-    query: str,
-    max_results: int = 5,
-    topic: Literal["general", "news", "finance"] = "general",
-) -> str:
+async def web_search_tavily(query: str) -> str:
     """
-    langchain-tavily 의 TavilySearch 도구를 사용하여 실시간 웹 검색을 수행합니다.
-    Tavily 원본 결과를 LLM으로 한 번 더 정제하여, 광고/구독 안내/조회수 같은
-    부가 텍스트를 제거하고 질의와 관련된 핵심 내용만 남긴 뒤 반환합니다.
+    Tavily 원격 MCP 서버(mcp.tavily.com)에 접속하는 WebResearchAgent 를 통해
+    실시간 웹 검색을 수행합니다. topic(general/news/finance) 선택이나 결과
+    필터링은 에이전트가 내부적으로 판단해서 처리합니다.
  
     Args:
         query: 검색할 질의문
-        max_results: 반환할 최대 검색 결과 수 (기본값 5, 최대 10)
-        topic: 검색 주제. 반드시 'general', 'news', 'finance' 중 하나만 사용.
-            - 기술/AI/프로그래밍 등 일반적인 질문 -> 'general'
-            - 최신 뉴스/시사 검색 -> 'news'
-            - 금융/주식/시장 관련 검색 -> 'finance'
     Returns:
-        검색 결과를 정리한 문자열 or 에러 메시지
+        사실 정보와 출처(citation)가 포함된 답변 문자열 or 에러 메시지
     """
-    if tavily_search_tool is None:
+    if not TAVILY_API_KEY:
         return (
             "TAVILY_API_KEY 가 설정되어 있지 않습니다. "
             ".env 파일에 TAVILY_API_KEY=tvly-... 형태로 추가해주세요."
         )
  
     try:
-        logger.info(f"Tavily 웹 검색 시작: {query} (topic={topic})")
- 
-        # langchain-tavily 의 TavilySearch 는 max_results를 invoke 시점에
-        # 바꿀 수 없으므로(인스턴스 생성 시 고정), 받아온 결과를 잘라서 사용.
-        # topic 은 invoke 시점에 지정 가능한 파라미터라 그대로 전달.
-        response = tavily_search_tool.invoke({"query": query, "topic": topic})
-        results = response.get("results", [])[: max(1, min(max_results, 10))]
- 
-        # LLM으로 한 번 더 정제 (광고/구독 안내/조회수 등 제거, 핵심만 재요약)
-        results = _clean_search_results(query, results)
- 
-        result_lines = []
- 
-        # Tavily 가 생성한 요약 답변이 있으면 먼저 표시
-        answer = response.get("answer")
-        if answer:
-            result_lines.append(f"## 📝 요약 답변\n{answer}\n")
- 
-        result_lines.append("## 🔎 검색 결과")
-        for i, item in enumerate(results, 1):
-            title = item.get("title", "제목 없음")
-            url = item.get("url", "#")
-            content = (item.get("content") or "").strip()
-            if not content:
-                continue
-            result_lines.append(f"{i}. [{title}]({url})\n   {content}")
- 
-        logger.info(f"Tavily 웹 검색 완료: {len(results)}개 결과")
-        return "\n".join(result_lines)
+        logger.info(f"Tavily 웹 검색 시작: {query}")
+        result = await _web_research_agent.answer(query)
+        logger.info("Tavily 웹 검색 완료")
+        return result
  
     except Exception as e:
         error_msg = f"Tavily 웹 검색 실패: {str(e)}"
         logger.error(error_msg)
         return error_msg
+
 
 # 8. 종합 브리핑
 @mcp.tool()
@@ -580,8 +546,10 @@ if __name__ == "__main__":
     # print(result)
     
     # ======== Tavily 검색 테스트 =========
-    result = web_search_tavily("2022년 카타르 월드컵 순위")
-    print(result)    
+    # import asyncio
+    # result = asyncio.run(web_search_tavily("2022년 한국 카타르 월드컵 순위"))
+    # print(result)
+        
     #=========== MCP 서버 테스트 =============
-    # mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http")
 
