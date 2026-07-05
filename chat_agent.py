@@ -1,9 +1,9 @@
 """
-Chat Agent Server - MCP 도구를 사용하는 LangGraph 에이전트 서버
+Chat Agent Server - MCP 도구를 사용하는 에이전트 서버
 
 [전체 동작 흐름]
 1. MCP 서버(mcp_server.py)에 연결하여 7개 도구를 로드
-2. LangGraph ReAct 에이전트 생성 (도구를 자동으로 선택하고 실행)
+2. ReAct 에이전트 생성 (도구를 자동으로 선택하고 실행)
 3. FastAPI 서버로 사용자 메시지를 받음
 4. 에이전트가 필요한 도구를 선택해서 실행
 5. 결과를 SSE(Server-Sent Events)로 스트리밍 응답
@@ -17,7 +17,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from langchain.agents import create_agent
-#from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.tools import load_mcp_tools
